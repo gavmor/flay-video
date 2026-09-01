@@ -1,0 +1,254 @@
+# flay-video -- standalone Concourse pipeline for semantic keyframe
+# selection from video: CPU-decode ingestion of a raw source (ffmpeg),
+# quality-filter frames, embed survivors with CLIP ViT-L/14, cluster with
+# HDBSCAN (density-based -- pans/crossfades/near-duplicates naturally fall
+# out as the -1 "noise" label instead of needing to be hand-detected), then
+# keep the frame closest to each cluster's centroid as that scene's
+# keyframe.
+#
+# 2026-08-31: split out of gavmor/comfyui-workflows (blades68-lora) into
+# this standalone repo. Reasoning: this is a generic, reusable capability
+# that works on any video source -- not tied to Blade '68 content -- same
+# "standalone repo by design" call already made for gavmor/T2VA rather
+# than folding it into a project-specific repo. Runs on the same shared
+# Concourse instance/GPU box as blades68-lora and T2VA (fly target
+# `blades68`), reusing the same physical `gpu-lock` pool and self-hosted
+# MinIO -- those are genuinely shared infra, not duplicated here.
+#
+# Architecture: GPU work is a plain inline Concourse task, not a curl to a
+# persistent host service. Verified directly (two throwaway `fly execute`
+# tasks) that this Concourse deployment's task containers have real GPU
+# compute access (a bare nvidia/cuda task image can run nvidia-smi and see
+# the physical GPU) but no host-filesystem access (clean overlayfs, no
+# bind mounts). So candidate stills are staged in MinIO as one tarball per
+# source and pulled via a plain `s3` resource `get`; no persistent
+# sibling container, no flush-vram step (an ephemeral task's GPU memory is
+# freed for free when the container exits).
+#
+# NVDEC (GPU-accelerated decode) was evaluated for the ingestion step and
+# is not yet wired in: confirmed that Concourse tasks CAN get NVDEC access
+# via `NVIDIA_DRIVER_CAPABILITIES: compute,utility,video` in a task's
+# params (zero blast radius, per-task only), but the one publicly
+# available test image tried (jrottenberg/ffmpeg) hit a separate
+# nvcodec-header/driver-version mismatch during actual multi-frame decode.
+# CPU decode via ffmpeg is proven adequate for now (~13 hours of source
+# video extracted in ~25 minutes wall-clock for the first real batch) --
+# revisit if ingestion volume grows enough to matter.
+#
+# Setting the pipeline:
+#   fly -t blades68 set-pipeline -p flay-video \
+#     -c concourse/pipeline.yml \
+#     -l concourse/vars.default.yml -l concourse/.secrets/vars.yml
+#   fly -t blades68 unpause-pipeline -p flay-video
+#
+# Ingesting a new source: tar its raw video (even if it's several files)
+# and upload to s3://((minio_bucket))/frame-flay/raw-video/<name>-<version>.tar.gz,
+# then re-set the pipeline with -v flay_raw_video_regexp / -v
+# flay_source_name / -v flay_candidate_regexp all pointed at <name>. Both
+# `get` steps in the job chain have trigger: true, so from there it's
+# hands-off: extract-candidates fires, then flay-video fires off its
+# output automatically.
+
+resources:
+  # This repo itself -- carries concourse/frame-flay/flay_video.py, the
+  # script the flay-video task runs.
+  - name: workflow-repo
+    type: git
+    icon: source-repository
+    source:
+      uri: git@github.com:gavmor/flay-video.git
+      branch: main
+      private_key: ((workflow_repo_private_key))
+
+  # Same physical gpu-lock pool every other GPU-touching pipeline on this
+  # box uses -- cross-pipeline exclusivity requires sharing the one pool,
+  # not standing up a second one.
+  - name: gpu-lock
+    type: pool
+    icon: lock
+    source:
+      uri: git@github.com:gavmor/concourse-locks.git
+      branch: main
+      pool: gpu
+      private_key: ((gpu_lock_repo_private_key))
+
+  # Input to extract-candidates: a new source's raw video, staged as ONE
+  # tarball (even if the source is several files) under its own prefix in
+  # the existing self-hosted MinIO (shared bucket, own prefix -- same
+  # bucket blades68-lora's charref-sheets-s3/crew-group-portraits-s3
+  # already use, just a different top-level prefix). The s3 resource type
+  # tracks versions of a single logical object via the regexp capture
+  # group -- it is NOT a directory listing, so many loose per-file keys
+  # under one prefix will not work (learned the hard way on the first
+  # pass: 775 loose .jpg keys couldn't be fetched as a set).
+  - name: flay-raw-video-s3
+    type: s3
+    icon: archive-outline
+    source:
+      endpoint: ((minio_endpoint))
+      bucket: ((minio_bucket))
+      regexp: ((flay_raw_video_regexp))
+      access_key_id: ((minio_access_key))
+      secret_access_key: ((minio_secret_key))
+      region_name: us-east-1
+      disable_ssl: true
+
+  # Input to flay-video: candidate stills, also one tarball per source
+  # (extract-candidates' own output).
+  - name: flay-candidate-stills-s3
+    type: s3
+    icon: archive-outline
+    source:
+      endpoint: ((minio_endpoint))
+      bucket: ((minio_bucket))
+      regexp: ((flay_candidate_regexp))
+      access_key_id: ((minio_access_key))
+      secret_access_key: ((minio_secret_key))
+      region_name: us-east-1
+      disable_ssl: true
+
+  # Output: selected keyframes + manifest.json, tarred up (s3 resource
+  # versions one object, not a directory) under its own prefix.
+  - name: flay-result-s3
+    type: s3
+    icon: archive-outline
+    source:
+      endpoint: ((minio_endpoint))
+      bucket: ((minio_bucket))
+      regexp: frame-flay/results/flay-result-(.*)\.tar\.gz
+      access_key_id: ((minio_access_key))
+      secret_access_key: ((minio_secret_key))
+      region_name: us-east-1
+      disable_ssl: true
+
+jobs:
+  # extract-candidates: CPU-decode ingestion of a raw video source into
+  # candidate stills. No gpu-lock/serial_groups here deliberately -- this
+  # is pure CPU work (ffmpeg, no GPU touched at all), so gating it behind
+  # the GPU lock would only add needless serialization against the real
+  # GPU-touching job below.
+  - name: extract-candidates
+    plan:
+      - get: workflow-repo
+      - get: flay-raw-video-s3
+        trigger: true
+      - task: run-extract-candidates
+        timeout: 2h
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: { repository: ubuntu, tag: "22.04" }
+          inputs:
+            - name: flay-raw-video-s3
+          outputs:
+            - name: candidates-tar
+          caches:
+            - path: apt-cache
+          params:
+            FLAY_SOURCE_NAME: ((flay_source_name))
+            FLAY_EXTRACT_FPS: ((flay_extract_fps))
+          run:
+            path: sh
+            args:
+              - -c
+              - |
+                set -e
+                apt-get -o dir::cache::archives=apt-cache update -qq
+                apt-get -o dir::cache::archives=apt-cache install -y -qq ffmpeg > /dev/null
+                mkdir -p raw-video candidates
+                tar xzf flay-raw-video-s3/*.tar.gz -C raw-video
+                for f in raw-video/*.mp4; do
+                  base=$(basename "$f" .mp4)
+                  echo "--- [$(date -Iseconds)] extracting $base at ${FLAY_EXTRACT_FPS} fps ---"
+                  ffmpeg -i "$f" -vf "fps=${FLAY_EXTRACT_FPS},scale=-2:720" -q:v 3 \
+                    "candidates/${base}_%04d.jpg" -loglevel error
+                done
+                cd candidates
+                COUNT=$(ls -1 *.jpg 2>/dev/null | wc -l)
+                echo "--- extracted $COUNT candidate stills ---"
+                # $(ls *.jpg 2>/dev/null) rather than a bare *.jpg -- a
+                # source with very short clips or a very sparse fps could
+                # legitimately extract zero candidates, and the job
+                # should say so via an empty archive, not crash on an
+                # unmatched glob passed literally to tar.
+                tar czf "../candidates-tar/${FLAY_SOURCE_NAME}-candidates-$(date +%Y%m%d%H%M%S).tar.gz" $(ls *.jpg 2>/dev/null)
+      - put: flay-candidate-stills-s3
+        params: { file: "candidates-tar/*-candidates-*.tar.gz" }
+
+  - name: flay-video
+    serial_groups: [gpu]
+    plan:
+      - get: workflow-repo
+      - get: flay-candidate-stills-s3
+        trigger: true
+      - put: gpu-lock
+        params: { acquire: true }
+      - task: run-flay-job
+        timeout: 1h
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            # Public image, no custom build/registry-push needed -- torch
+            # + CUDA 12.4 runtime already present; only transformers/
+            # scikit-learn/opencv are installed at task-run time.
+            source: { repository: pytorch/pytorch, tag: "2.6.0-cuda12.4-cudnn9-runtime" }
+          inputs:
+            - name: workflow-repo
+            - name: flay-candidate-stills-s3
+          outputs:
+            - name: flay-result
+            - name: flay-result-tar
+          # This deployment has exactly one Concourse worker (`fly
+          # workers` confirms, every build lands on the same worker ID),
+          # so a task-level cache reliably persists here -- avoids
+          # re-downloading the ~1.7GB CLIP checkpoint and reinstalling
+          # pip deps on every run.
+          caches:
+            - path: hf-cache
+            - path: pip-cache
+          params:
+            FLAY_MIN_CLUSTER_SIZE: ((flay_min_cluster_size))
+            FLAY_MIN_SAMPLES: ((flay_min_samples))
+            FLAY_BLUR_THRESHOLD: ((flay_blur_threshold))
+            FLAY_DARK_THRESHOLD: ((flay_dark_threshold))
+            FLAY_MAX_EDGE: ((flay_max_edge))
+            HF_HOME: hf-cache
+            PIP_CACHE_DIR: pip-cache
+          run:
+            path: sh
+            args:
+              - -c
+              - |
+                set -e
+                pip install --quiet transformers scikit-learn opencv-python-headless
+                mkdir -p candidate-stills
+                tar xzf flay-candidate-stills-s3/*.tar.gz -C candidate-stills
+                MIN_SAMPLES_ARG=""
+                if [ -n "$FLAY_MIN_SAMPLES" ] && [ "$FLAY_MIN_SAMPLES" != "null" ]; then
+                  MIN_SAMPLES_ARG="--min-samples $FLAY_MIN_SAMPLES"
+                fi
+                python3 workflow-repo/concourse/frame-flay/flay_video.py \
+                  --input-dir candidate-stills \
+                  --output-dir flay-result \
+                  --min-cluster-size "$FLAY_MIN_CLUSTER_SIZE" \
+                  --blur-threshold "$FLAY_BLUR_THRESHOLD" \
+                  --dark-threshold "$FLAY_DARK_THRESHOLD" \
+                  --max-edge "$FLAY_MAX_EDGE" \
+                  $MIN_SAMPLES_ARG
+                cd flay-result
+                # flay-result-s3's regexp requires a non-empty version
+                # capture group -- a bare flay-result.tar.gz fails the
+                # s3 put with "regex does not match provided version"
+                # after the real work is already done. Build timestamp
+                # is a fine version string here.
+                tar czf "../flay-result-tar/flay-result-$(date +%Y%m%d%H%M%S).tar.gz" manifest.json $(ls *.jpg 2>/dev/null)
+        ensure:
+          # No flush-vram needed -- an ephemeral task's GPU memory is
+          # reclaimed when the container exits, nothing persistent to
+          # leak.
+          put: gpu-lock
+          params: { release: gpu-lock }
+      - put: flay-result-s3
+        params: { file: flay-result-tar/*.tar.gz }

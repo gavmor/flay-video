@@ -1,0 +1,46 @@
+# Non-secret, environment-specific config for concourse/pipeline.yml.
+# Committed on purpose -- facts about *this* Concourse deployment's local
+# network topology, not credentials. Load alongside the gitignored
+# .secrets/vars.yml, which holds the actual secrets (this repo's own
+# deploy key, the gpu-lock repo's key, MinIO access keys):
+#
+#   fly set-pipeline -p flay-video -c concourse/pipeline.yml \
+#     -l concourse/vars.default.yml -l concourse/.secrets/vars.yml
+#
+# minio_endpoint/minio_bucket/gpu-lock are genuinely shared infra with
+# gavmor/comfyui-workflows (blades68-lora) and gavmor/T2VA on this same
+# box -- same self-hosted MinIO, same physical GPU, same Concourse
+# instance (fly target `blades68`) -- not duplicated services, just
+# reused via matching endpoint/bucket values.
+minio_endpoint: http://192.168.16.1:9000
+minio_bucket: blades68-crew-groups
+
+# flay_raw_video_regexp / flay_source_name / flay_extract_fps: which
+# staged source the extract-candidates job ingests. No meaningful
+# default -- left pointed at the first real source (the Kanopy-Downloader
+# "parts series") since that's what's actually staged in MinIO right now.
+# Re-set the pipeline with different values to point at a new source.
+flay_raw_video_regexp: frame-flay/raw-video/parts-series-(.*)\.tar\.gz
+flay_source_name: parts-series
+flay_extract_fps: "1/60"
+
+# flay_candidate_regexp: which staged candidate-stills tarball flay-video
+# consumes -- normally produced by extract-candidates above, matching
+# flay_source_name.
+flay_candidate_regexp: frame-flay/candidates/parts-series-candidates-(.*)\.tar\.gz
+
+flay_min_cluster_size: 3
+flay_min_samples: null
+
+# flay_blur_threshold: the textbook variance-of-Laplacian threshold of 100
+# assumes full-resolution, uncompressed frames. Measured directly against
+# the real parts-series candidate stills (720p, JPEG-compressed by the
+# ffmpeg extraction pass): median sharpness ~39, 95th percentile ~75 -- a
+# threshold of 100 passed only 18/775 frames. 15 sits at the ~5th
+# percentile of the actual distribution -- drops true outliers (near-zero
+# variance, i.e. blank/transition frames) without gutting the pool
+# HDBSCAN needs to find real clusters in. Recalibrate if a future
+# source's resolution/compression differs meaningfully from this one.
+flay_blur_threshold: 15.0
+flay_dark_threshold: 15.0
+flay_max_edge: 768

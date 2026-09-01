@@ -1,0 +1,8 @@
+# Deploy key + pipeline vars for the workflow-repo git resource -- never
+# commit. No trailing slash: a trailing-slash pattern only matches real
+# directories, but git treats a symlink as a file for gitignore matching
+# purposes, not a directory -- if this repo ever grows worktrees that
+# symlink back to this directory (see gavmor/comfyui-workflows'
+# docs/adr/0008 for the concrete incident), the directory-only form would
+# silently fail to match it there.
+concourse/.secrets
