@@ -34,6 +34,10 @@ Isolated and ruled out one at a time:
 
 **What this means practically:** the script is correct and crash-free at bounded scale (verified: 24 real frames, 3 batches, full pipeline including clustering and keyframe writing). It is **not yet** the true "process 100% of frames of an arbitrarily large corpus" capability — holding every processed frame's GPU buffers alive simultaneously for a 13-hour/~1.12M-frame source would need roughly 10TB of VRAM. `--max-frames` (wired into the Concourse job as `flay_exhaustive_max_frames`) is a required safety valve, not a tuning knob, until this is actually resolved upstream.
 
+## Source of the throughput numbers
+
+The original smoke-test script behind the ~400fps figure above was never preserved (`fly execute` doesn't archive local input dirs server-side, and local `/tmp` was wiped after the investigation). It's been reconstructed from build `1261330`'s preserved stdout log and re-executed live (build `1430505`) to confirm it's real, working code — see `docs/spike/nvdec_cvcuda_smoke_test.py`. Re-run reproduced the same shape of result (zero-copy confirmed, `cvtcolor`/`resize` completing on all 500 frames); it does not include the CLIP step, matching what the original run actually tested.
+
 ## Not yet attempted
 
 - Reporting the bug upstream to the PyNvVideoCodec or CV-CUDA projects.
