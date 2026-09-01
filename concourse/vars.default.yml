@@ -44,3 +44,27 @@ flay_min_samples: null
 flay_blur_threshold: 15.0
 flay_dark_threshold: 15.0
 flay_max_edge: 768
+
+# flay_exhaustive_batch_size: decode+CLIP batch size for
+# exhaustive-frame-flay's inline NVDEC->CV-CUDA->CLIP path. No production
+# benchmark yet at this batch size against a real multi-hour corpus (the
+# feasibility smoke test was single-frame-at-a-time on ~500 frames, not
+# this script's real batched loop) -- validate against a short real clip
+# before trusting this against a full multi-hour source, and revisit this
+# value once real throughput numbers exist.
+flay_exhaustive_batch_size: 16
+
+# flay_exhaustive_max_frames: REQUIRED safety valve, not a tuning knob --
+# see the KNOWN BLOCKING BUG note in flay_video_exhaustive.py and
+# flay-pipeline.yml's exhaustive-frame-flay job comment. The script's
+# current crash-avoidance workaround (a process-lifetime KEEPALIVE list
+# that never releases GPU buffers) means memory usage grows without bound
+# as more frames are processed. Only 24 frames have actually been verified
+# end-to-end (real keyframes + manifest, no crash, no OOM) -- 500 here is
+# an extrapolation from a rough per-frame VRAM estimate (~9MB/frame at
+# 1080p => ~4.5GB for 500 frames, well under this box's 24GB), NOT itself
+# directly measured. Verify real VRAM usage at whatever value you actually
+# run before trusting it unattended, and do not set to 0 (uncapped)
+# against a real multi-hour source until the upstream library bug is
+# actually fixed.
+flay_exhaustive_max_frames: 500

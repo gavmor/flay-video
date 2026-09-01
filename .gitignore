@@ -6,3 +6,5 @@
 # docs/adr/0008 for the concrete incident), the directory-only form would
 # silently fail to match it there.
 concourse/.secrets
+__pycache__/
+*.pyc

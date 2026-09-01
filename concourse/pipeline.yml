@@ -121,6 +121,21 @@ resources:
       region_name: us-east-1
       disable_ssl: true
 
+  # Output of the exhaustive-frame path: distinct prefix from flay-result-s3
+  # above so the two modes' outputs never collide/overwrite each other for
+  # the same source name.
+  - name: flay-result-exhaustive-s3
+    type: s3
+    icon: archive-outline
+    source:
+      endpoint: ((minio_endpoint))
+      bucket: ((minio_bucket))
+      regexp: frame-flay/results-exhaustive/flay-result-(.*)\.tar\.gz
+      access_key_id: ((minio_access_key))
+      secret_access_key: ((minio_secret_key))
+      region_name: us-east-1
+      disable_ssl: true
+
 jobs:
   # extract-candidates: CPU-decode ingestion of a raw video source into
   # candidate stills. No gpu-lock/serial_groups here deliberately -- this
@@ -251,4 +266,112 @@ jobs:
           put: gpu-lock
           params: { release: gpu-lock }
       - put: flay-result-s3
+        params: { file: flay-result-tar/*.tar.gz }
+
+  # exhaustive-frame-flay: process every decoded frame of a raw video
+  # source (not a sparse sample) via a zero-copy GPU-resident pipeline --
+  # PyNvVideoCodec (NVDEC hardware decode) hands frames to CV-CUDA (NV12->
+  # RGB + resize) via DLPack, straight into CLIP as a CUDA tensor. No
+  # frame touches host memory or disk until after HDBSCAN clustering,
+  # when only the winning ~handful of frames per source get re-decoded
+  # and saved as keyframe JPEGs. See concourse/frame-flay/
+  # flay_video_exhaustive.py for the full pipeline.
+  #
+  # 2026-09-01: added per Gavin -- "I want to sample 100% of frames, and
+  # I want to sample large corpuses of large videos." Verified feasible
+  # first (PyNvVideoCodec 2.2.2 + cvcuda-cu12 0.17.0 both pip-install
+  # cleanly against this box's driver 595.84, DLPack handoff confirmed
+  # zero-copy via a real decode->convert smoke test) before building this
+  # -- see docs/pynvvideocodec-feasibility.md.
+  #
+  # *** KNOWN BLOCKING BUG, NOT YET RESOLVED (see the script's own module
+  # docstring for the full writeup): PyNvVideoCodec/cvcuda's native objects
+  # crash the interpreter the moment ANY of them is released, confirmed
+  # true regardless of cause (cyclic GC, function return, same-scope
+  # reassignment). The script's current workaround is a process-lifetime
+  # KEEPALIVE list that never releases anything -- correct and crash-free
+  # in testing, but VRAM-bounded, not actually "100% of an arbitrarily
+  # large corpus" yet. flay_exhaustive_max_frames below is a REQUIRED
+  # safety valve, not a tuning knob -- an uncapped run against a real
+  # multi-hour source will OOM rather than complete. Treat this job as
+  # "verified-correct at bounded scale, blocked on an upstream library fix
+  # for true exhaustive-corpus scale" until that upstream bug is resolved.
+  #
+  # Reads directly from flay-raw-video-s3 (the same raw video resource
+  # extract-candidates uses) -- this path doesn't need the CPU-decode
+  # ingestion step at all, since NVDEC decode happens inline here.
+  #
+  # gpu-lock + serial_groups: this is a heavy, sustained GPU job (not a
+  # quick sub-2-minute task like flay-video's CLIP-on-a-subset run) --
+  # exclusivity against every other GPU-touching pipeline on this box
+  # matters even more here.
+  - name: exhaustive-frame-flay
+    serial_groups: [gpu]
+    plan:
+      - get: workflow-repo
+      - get: flay-raw-video-s3
+      - put: gpu-lock
+        params: { acquire: true }
+      - task: run-exhaustive-flay
+        timeout: 12h
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source: { repository: pytorch/pytorch, tag: "2.6.0-cuda12.4-cudnn9-runtime" }
+          inputs:
+            - name: workflow-repo
+            - name: flay-raw-video-s3
+          outputs:
+            - name: flay-result
+            - name: flay-result-tar
+          caches:
+            - path: hf-cache
+            - path: pip-cache
+          params:
+            NVIDIA_VISIBLE_DEVICES: all
+            # video capability is what actually enables NVDEC (libnvcuvid.so.1/
+            # libnvidia-encode.so.1) -- confirmed reproducibly this session
+            # (3/3 separate fly execute runs) that the default compute,utility
+            # set alone leaves those libraries unmounted and ffmpeg/PyNvVideoCodec
+            # segfault trying to load them.
+            NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+            FLAY_BATCH_SIZE: ((flay_exhaustive_batch_size))
+            FLAY_MAX_FRAMES: ((flay_exhaustive_max_frames))
+            FLAY_MIN_CLUSTER_SIZE: ((flay_min_cluster_size))
+            FLAY_MIN_SAMPLES: ((flay_min_samples))
+            FLAY_BLUR_THRESHOLD: ((flay_blur_threshold))
+            FLAY_DARK_THRESHOLD: ((flay_dark_threshold))
+            FLAY_MAX_EDGE: ((flay_max_edge))
+            HF_HOME: hf-cache
+            PIP_CACHE_DIR: pip-cache
+          run:
+            path: sh
+            args:
+              - -c
+              - |
+                set -e
+                pip install --quiet PyNvVideoCodec cvcuda-cu12 transformers scikit-learn
+                mkdir -p raw-video
+                tar xzf flay-raw-video-s3/*.tar.gz -C raw-video
+                MIN_SAMPLES_ARG=""
+                if [ -n "$FLAY_MIN_SAMPLES" ] && [ "$FLAY_MIN_SAMPLES" != "null" ]; then
+                  MIN_SAMPLES_ARG="--min-samples $FLAY_MIN_SAMPLES"
+                fi
+                python3 workflow-repo/concourse/frame-flay/flay_video_exhaustive.py \
+                  --input-dir raw-video \
+                  --output-dir flay-result \
+                  --batch-size "$FLAY_BATCH_SIZE" \
+                  --max-frames "$FLAY_MAX_FRAMES" \
+                  --min-cluster-size "$FLAY_MIN_CLUSTER_SIZE" \
+                  --blur-threshold "$FLAY_BLUR_THRESHOLD" \
+                  --dark-threshold "$FLAY_DARK_THRESHOLD" \
+                  --max-edge "$FLAY_MAX_EDGE" \
+                  $MIN_SAMPLES_ARG
+                cd flay-result
+                tar czf "../flay-result-tar/flay-result-$(date +%Y%m%d%H%M%S).tar.gz" manifest.json $(ls *.jpg 2>/dev/null)
+        ensure:
+          put: gpu-lock
+          params: { release: gpu-lock }
+      - put: flay-result-exhaustive-s3
         params: { file: flay-result-tar/*.tar.gz }
