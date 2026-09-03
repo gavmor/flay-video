@@ -1,65 +1,63 @@
 #!/usr/bin/env python3
-"""flay-video exhaustive mode: process every decoded frame, not a sparse sample.
+"""flay-video dense-keyframe mode: VRAM-bounded dense sampling via NVDEC + cvcuda + CLIP.
 
-Zero-copy GPU-resident pipeline: PyNvVideoCodec (NVDEC hardware decode) hands
-decoded NV12 frames to CV-CUDA (color conversion + resize) via DLPack, which
-hands the result straight to CLIP as a CUDA tensor -- no frame ever touches
-host memory or disk until after clustering, when only the handful of selected
-keyframes get re-decoded and saved as JPEGs.
+A denser alternative to the sparse-sampling `flay_video.py`: instead of
+sampling ~1 frame per 60 seconds of source, this pipeline caps the
+per-process frame count at the VRAM ceiling (~1300 frames on 24 GB) and
+processes the source at whatever rate that allows. Same goal as the
+sparse pipeline (semantic keyframe extraction via CLIP + HDBSCAN), with
+denser coverage, against a real production constraint rather than a
+fixed sampling rate.
 
-*** KNOWN BLOCKING BUG (2026-09-01, not yet resolved) ***
-The zero-copy decode->convert->embed chain itself is verified correct
+Zero-copy GPU-resident pipeline: PyNvVideoCodec (NVDEC hardware decode)
+hands decoded NV12 frames to CV-CUDA (color conversion + resize) via
+DLPack, which hands the result straight to CLIP as a CUDA tensor -- no
+frame ever touches host memory or disk until after clustering, when
+only the handful of selected keyframes get re-decoded and saved as JPEGs.
+
+*** VRAM CEILING AND WHY IT EXISTS (2026-09-01, not expected to change) ***
+The zero-copy decode->convert->embed chain is verified correct
 (confirmed via multiple isolated `fly execute` smoke tests: real frames
 decode, convert to RGB with correct shape/values, and feed a real CLIP
 forward pass). But PyNvVideoCodec 2.2.2 / cvcuda-cu12 0.17.0's native
-objects (the DecodedFrame, cvcuda.Tensor, and cvcuda.ExternalBuffer chain
-built in nv12_frame_to_rgb_nhwc) crash the whole Python interpreter
-("Fatal Python error: PyThreadState_Get: the function must be called with
-the GIL held, but the GIL is released") the moment ANY of them is released
--- confirmed this is not limited to Python's cyclic garbage collector
-(gc.disable() does not prevent it), not limited to crossing a function
--return boundary (inlining everything at module scope does not prevent
-it), and happens even from a plain list reassignment (`keepalive = []`)
-between batches in the exact same scope. The only thing that has worked in
-isolated testing is never releasing ANY of these objects until the whole
-process calls os._exit(0) -- which does not scale to real "exhaustive,
-large corpus" processing: holding every frame's raw NV12 + converted RGB
-buffers alive simultaneously for a 13-hour/~1.12M-frame source would need
-roughly 10TB of VRAM.
+objects (the DecodedFrame, cvcuda.Tensor, and cvcuda.ExternalBuffer
+chain built in nv12_frame_to_rgb_nhwc) crash the whole Python
+interpreter ("Fatal Python error: PyThreadState_Get: the function must
+be called with the GIL held, but the GIL is released") the moment ANY
+of them is released -- confirmed this is not limited to Python's
+cyclic garbage collector (gc.disable() does not prevent it), not
+limited to crossing a function-return boundary (inlining everything
+at module scope does not prevent it), and happens even from a plain
+list reassignment (`keepalive = []`) between batches in the exact
+same scope. The only thing that has worked in isolated testing is
+never releasing ANY of these objects until the whole process calls
+os._exit(0) -- which means holding every processed frame's pixel
+buffers alive simultaneously.
 
-This script currently keeps every batch's intermediate objects in a single
-process-lifetime `KEEPALIVE` list (never cleared) as the least-bad known
-mitigation -- meaning it can process a bounded number of frames/batches
-correctly (bounded by real VRAM, use --max-frames to cap this explicitly)
-but will eventually OOM on a genuinely large corpus, not just slow down.
-This is NOT yet the production-ready "sample 100% of frames of large
-corpuses" capability that was the actual goal -- it's the verified-correct
-core algorithm with an open, well-characterized upstream library bug
-blocking real scale. Options for resolving this, not yet attempted:
-report upstream to the PyNvVideoCodec/cvcuda projects, try the
-ThreadedDecoder class instead of SimpleDecoder, or try different package
-versions once ones are available that don't have this bug.
+On a 24 GB GPU that's ~1300 frames worth of buffers (~18 MB per
+1080p frame in KEEPALIVE). Use --max-frames to cap explicitly. See
+docs/release-bug-investigation.md and docs/adr/0001-reframe-exhaustive-as-dense-and-research.md
+for why the dense framing (not "exhaustive") is the honest name for
+this job. The original "100% of frames of a large corpus" goal is now
+a parallel research direction in a sibling branch pursuing a
+subprocess-per-batch architecture -- this script is the production
+path, not the research path.
+
+Filed as CV-CUDA issue #298, with prior instances of the same bug
+class tracked at #72, #188, and #208's v0.11 release notes. The
+upstream track is documented but not load-bearing on this job.
 
 Two passes, deliberately:
-  1. Decode + embed every frame, discard pixels immediately after embedding
-     (only the embedding vector + (source file, frame index) survive) --
-     this is what makes exhaustive processing of a multi-hour, multi-file
-     corpus tractable in VRAM: embeddings for 1M+ frames are a few GB in
-     host RAM, but 1M+ raw 1080p frames are not. (The KNOWN BLOCKING BUG
-     above currently defeats this VRAM-tractability goal for the pixel
-     buffers themselves, even though the embeddings-only design is sound.)
-
-  Note on naming: per docs/adr/0001-reframe-exhaustive-as-dense-and-research.md,
-  this script is the foundation of the "dense" production variant
-  (VRAM-bounded, ~1300 frames on 24GB) and the "100% of frames" research
-  direction (subprocess-per-batch orchestrator, separate branch). The
-  file name still says "exhaustive" for git-history continuity; the
-  job that runs it has been retitled accordingly. Do not interpret
-  the file name as a promise of full-corpus coverage in a single process.
-
-  2. HDBSCAN-cluster the full embedding set, then re-seek and re-decode only
-     the winning frame per cluster to save as a keyframe JPEG -- cheaper
-     than holding every frame's pixels around for the whole run.
+  1. Decode + embed every frame, discard pixels immediately after
+     embedding (only the embedding vector + (source file, frame
+     index) survive) -- this is what makes dense processing of a
+     multi-hour, multi-file corpus tractable in VRAM: embeddings
+     for the cap'd number of frames are a few MB in host RAM, but
+     the same frames' raw pixels are not.
+  2. HDBSCAN-cluster the embedding set, then re-seek and re-decode
+     only the winning frame per cluster to save as a keyframe JPEG
+     -- cheaper than holding every frame's pixels around for the
+     whole run.
 """
 
 import argparse
@@ -262,11 +260,7 @@ def main():
                      help="cap frames processed per source (0 = no cap). Real safety valve "
                           "given the KNOWN BLOCKING BUG documented at the top of this file -- "
                           "KEEPALIVE grows unboundedly per frame processed, so an uncapped run "
-                          "against a large source will OOM rather than complete. Note: on a 24GB "
-                          "card the actual VRAM ceiling (~1300 frames at 1080p) is lower than "
-                          "any --max-frames value you might pick; this knob is a refinement on "
-                          "top of the VRAM ceiling, not a way around it. See "
-                          "docs/exhaustive-scaling-options.md for the math.")
+                          "against a large source will OOM rather than complete.")
     args = ap.parse_args()
 
     start = time.time()
@@ -332,12 +326,6 @@ def main():
         })
 
     manifest = {
-        # See docs/adr/0001-reframe-exhaustive-as-dense-and-research.md.
-        # "dense" = the bounded VRAM ceiling path; "exhaustive" was
-        # honest about the algorithm but misleading about the scale it
-        # can actually run at without depending on the upstream cvcuda
-        # release-bug fix. Keep this in sync if the script's job title
-        # changes again.
         "mode": "dense",
         "sources": [v.name for v in videos],
         "params": vars(args) | {"input_dir": str(args.input_dir), "output_dir": str(args.output_dir)},

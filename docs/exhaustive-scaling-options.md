@@ -1,7 +1,7 @@
 # Exhaustive-frame scaling options — architecture comparison
 
 **Date:** 2026-09-02
-**Trigger:** Discussion of whether the current `flay_video_exhaustive.py` design can actually scale to a multi-hour, multi-source corpus given the PyNvVideoCodec / cvcuda release-on-collect bug documented in `pynvvideocodec-feasibility.md` and `flay_video_exhaustive.py`'s module docstring.
+**Trigger:** Discussion of whether the original `flay_video_exhaustive.py` design (now renamed to `flay_video_dense.py` per ADR 0001, but the underlying constraint is the same) can actually scale to a multi-hour, multi-source corpus given the PyNvVideoCodec / cvcuda release-on-collect bug documented in `pynvvideocodec-feasibility.md` and `flay_video_dense.py`'s module docstring.
 
 ## The shared constraint all four options inherit
 
@@ -63,7 +63,7 @@ sequenceDiagram
     P->>P: subprocess per cluster winner<br/>(re-decode + save JPEG,<br/>also bounded)
 ```
 
-**What changes:** introduce a parent script (`flay_video_exhaustive_orchestrator.py`?) that splits work into batches, spawns a child for each batch with a clean Python interpreter, and the child only holds *its own batch's* frames in `KEEPALIVE` before exiting. The parent concatenates the per-batch embedding shards and clusters.
+**What changes:** introduce a parent script (`flay_video_orchestrator.py` or similar, in a sibling research branch) that splits work into batches, spawns a child for each batch with a clean Python interpreter, and the child only holds *its own batch's* frames in `KEEPALIVE` before exiting. The parent concatenates the per-batch embedding shards and clusters.
 
 **Properties:**
 - Per-batch VRAM ceiling: 18 MB × batch_size (e.g. 100 frames = 1.8 GB — fits comfortably on 24 GB alongside CLIP)
@@ -136,7 +136,7 @@ flowchart LR
     style LATER fill:#eee,stroke-dasharray: 5 5
 ```
 
-**What changes:** nothing. Today's state — `flay_video_exhaustive.py` with `--max-frames`, `KEEPALIVE` docstring, `os._exit(0)`, the INCOMPLETE-marker smoke test — is honest about the bound.
+**What changes:** nothing. Today's state — `flay_video_dense.py` with `--max-frames`, `KEEPALIVE` docstring, `os._exit(0)`, the INCOMPLETE-marker smoke test — is honest about the bound.
 
 **Properties:**
 - No time spent, no new code, no new bugs

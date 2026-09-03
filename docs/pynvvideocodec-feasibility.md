@@ -1,7 +1,9 @@
-# PyNvVideoCodec / CV-CUDA feasibility — exhaustive frame processing
+# PyNvVideoCodec / CV-CUDA feasibility — dense keyframe extraction
 
 **Date:** 2026-09-01
 **Trigger:** Gavin: "I want to sample 100% of frames, and I want to sample large corpuses of large videos. I don't see any reason to leave a performance stone unturned."
+
+**Update 2026-09-02:** the "100% of frames" goal is now the research direction (subprocess-per-batch, in a sibling branch); this feasibility doc and the pipeline it informs were reframed as the **dense** keyframe extraction path. See `docs/adr/0001-reframe-exhaustive-as-dense-and-research.md` for the decision and `docs/release-bug-investigation.md` for the upstream-bug investigation that informed it. The pipeline (`concourse/frame-flay/flay_video_dense.py`, formerly `flay_video_exhaustive.py`) and the underlying technical analysis below are unchanged — only the framing changed.
 
 ## Summary
 
@@ -32,7 +34,7 @@ Isolated and ruled out one at a time:
 
 **Current workaround:** a process-lifetime `KEEPALIVE` list in `flay_video_dense.py` that never releases anything — objects only actually get freed when the whole process exits via `os._exit(0)` (a normal `sys.exit()`/return also crashes at interpreter finalization for the same underlying reason, independent of whether `dec.stop()` is called — which is itself separately broken in this package version, raising `AttributeError` unconditionally).
 
-**What this means practically:** the script is correct and crash-free at bounded scale (verified: 24 real frames, 3 batches, full pipeline including clustering and keyframe writing). It is **not yet** the true "process 100% of frames of an arbitrarily large corpus" capability — holding every processed frame's GPU buffers alive simultaneously for a 13-hour/~1.12M-frame source would need roughly 10TB of VRAM. `--max-frames` (wired into the Concourse job as `flay_dense_max_frames`) is a required safety valve, not a tuning knob, until this is actually resolved upstream.
+**What this means practically:** the script is correct and crash-free at bounded scale (verified: 24 real frames, 3 batches, full pipeline including clustering and keyframe writing). It is **not yet** the true "process 100% of frames of an arbitrarily large corpus" capability — holding every processed frame's GPU buffers alive simultaneously for a 13-hour/~1.12M-frame source would need roughly 10TB of VRAM. `--max-frames` (wired into the Concourse job as `flay_dense_max_frames`, default 1300 = the production-path VRAM ceiling on 24 GB) is a required safety valve, not a tuning knob, until this is actually resolved upstream.
 
 ## Source of the throughput numbers
 
@@ -40,10 +42,29 @@ The original smoke-test script behind the ~400fps figure above was never preserv
 
 ## Not yet attempted
 
-- A batched (not single-frame-at-a-time) throughput benchmark at real scale — the ~400fps number above predates this session's bug-hunting and used a simpler, non-batched test loop. The `dense-keyframe-flay` job's real `flay_video_dense.py` does run batched (`--batch-size`, default 16) and is what would be benchmarked; no production-scale run against a real multi-hour source has happened yet.
+~~- Reporting the bug upstream to the PyNvVideoCodec or CV-CUDA projects.~~
+  **Resolved 2026-09-02** — filed as
+  [CVCUDA/CV-CUDA#298](https://github.com/CVCUDA/CV-CUDA/issues/298).
+  PyNvVideoCodec has no public tracker (source on NVIDIA NGC), but
+  the crash signature is from cvcuda's object chain so the CV-CUDA
+  report is the right one. Repro is preserved at
+  [gavmor/cvcuda-bug-repros](https://github.com/gavmor/cvcuda-bug-repros).
+  Full investigation results (including prior-reports search
+  revealing the bug is a recurring class previously "fixed" in #72,
+  #188, and #208's v0.11 notes) are in
+  `docs/release-bug-investigation.md`.
 
-## Resolved (see `release-bug-investigation.md` for the full writeup)
+~~- `PyNvVideoCodec.ThreadedDecoder` instead of `SimpleDecoder` (a different class in the same package — untested here, might have different buffer-lifetime semantics).~~
+  **Resolved 2026-09-02** — investigated, does not avoid the bug.
+  Same SIGSEGV on the second batch's cvcuda call with the same
+  trigger. The bug is in cvcuda's release path, not the decoder
+  class. See `docs/release-bug-investigation.md`.
 
-- ~~Reporting the bug upstream to the PyNvVideoCodec or CV-CUDA projects.~~ Filed as [CV-CUDA issue #298](https://github.com/CVCUDA/CV-CUDA/issues/298), with explicit references to prior instances #72 and #188.
-- ~~`PyNvVideoCodec.ThreadedDecoder` instead of `SimpleDecoder`~~ — tested, same bug, same crash signature. `ThreadedDecoder` is a multi-threaded *fetch* primitive, not a different buffer-lifetime model.
-- ~~Different package versions, if/when ones without this bug become available.~~ Bug reproduces in every version combination on PyPI: PyNvVideoCodec 2.0.0/2.0.5/2.1/2.2.2 × cvcuda 0.15/0.16/0.17. No version-upgrade path exists. The fix has to come from a code change in CV-CUDA or PyNvVideoCodec.
+- Different package versions, if/when ones without this bug become available.
+  **Partially resolved 2026-09-02** — every version combination on
+  PyPI was tested (cvcuda 0.15/0.16/0.17 × PyNvVideoCodec 2.0/2.0.5/2.1/2.2.2);
+  all reproduce. No version upgrade path exists. The bug predates
+  all publicly available versions. See
+  `docs/release-bug-investigation.md`.
+
+- A batched (not single-frame-at-a-time) throughput benchmark at real scale — the ~400fps number above predates this session's bug-hunting and used a simpler, non-batched test loop.

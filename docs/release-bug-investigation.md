@@ -23,7 +23,7 @@ A 30-line minimal repro (`/tmp/flay-smoke/multi_batch_repro.py` on the scratch m
 
 1. Opens a `SimpleDecoder` (or `ThreadedDecoder`) on a real video
 2. Calls `get_batch_frames(1)` once
-3. Builds the cvcuda chain exactly as `flay_video_exhaustive.nv12_frame_to_rgb_nhwc` does: `torch.from_dlpack` → NHWC reshape → `cvcuda.as_tensor` → `cvcuda.cvtcolor(..., YUV2RGB_NV12)` → `.cuda()` → `torch.from_dlpack`
+3. Builds the cvcuda chain exactly as `flay_video_dense.nv12_frame_to_rgb_nhwc` does: `torch.from_dlpack` → NHWC reshape → `cvcuda.as_tensor` → `cvcuda.cvtcolor(..., YUV2RGB_NV12)` → `.cuda()` → `torch.from_dlpack`
 4. Holds the resulting tensors in a module-scope list
 5. Reassigns that list (`keepalive = []`) — the exact trigger documented in the feasibility doc
 6. Calls `get_batch_frames(1)` again

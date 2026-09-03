@@ -45,29 +45,24 @@ flay_blur_threshold: 15.0
 flay_dark_threshold: 15.0
 flay_max_edge: 768
 
-# flay_dense_batch_size: decode+CLIP batch size for dense-keyframe-flay's
-# inline NVDEC->CV-CUDA->CLIP path. No production benchmark yet at this
-# batch size against a real multi-hour corpus (the feasibility smoke test
-# was single-frame-at-a-time on ~500 frames, not this script's real
-# batched loop) -- validate against a short real clip before trusting
-# this against a full multi-hour source, and revisit this value once real
-# throughput numbers exist.
+# flay_dense_batch_size: decode+CLIP batch size for
+# dense-keyframe-flay's inline NVDEC->CV-CUDA->CLIP path. No production
+# benchmark yet at this batch size against a real multi-hour corpus (the
+# feasibility smoke test was single-frame-at-a-time on ~500 frames, not
+# this script's real batched loop) -- validate against a short real clip
+# before trusting this against a full multi-hour source, and revisit this
+# value once real throughput numbers exist.
 flay_dense_batch_size: 16
 
-# flay_dense_max_frames: REQUIRED safety valve, not a tuning knob -- see
-# the KNOWN BLOCKING BUG note in flay_video_dense.py and the comment on
-# pipeline.yml's dense-keyframe-flay job. The script's current
-# crash-avoidance workaround (a process-lifetime KEEPALIVE list that
-# never releases GPU buffers) means memory usage grows without bound as
-# more frames are processed. The VRAM ceiling on this 24GB box is ~1300
-# frames at 1080p (~18MB/frame for raw NV12 + cvcuda views + the
-# ExternalBuffer RGB chain built in nv12_frame_to_rgb_nhwc), per the
-# math in docs/exhaustive-scaling-options.md and
-# docs/release-bug-investigation.md. Only 24 frames have actually been
-# verified end-to-end against this script's real batched loop (real
-# keyframes + manifest, no crash, no OOM) -- 1300 is the per-process
-# VRAM ceiling, NOT a directly-verified end-to-end run. Verify real
-# VRAM usage at whatever value you actually run before trusting it
-# unattended, and do not set to 0 (uncapped) against a real multi-hour
-# source until the upstream library bug is actually fixed.
+# flay_dense_max_frames: REQUIRED safety valve, not a tuning knob. The
+# cvcuda/PyNvVideoCodec release-bug (filed as CV-CUDA #298, full writeup
+# in flay_video_dense.py's module docstring) means the script's
+# crash-avoidance workaround is a process-lifetime KEEPALIVE list that
+# never releases GPU buffers. On a 24 GB GPU that caps real usable
+# frame count to ~1300 (measured: ~18 MB/frame in KEEPALIVE at 1080p,
+# empirically verified in the docs/release-bug-investigation.md math).
+# This default is the production-path cap: 1300 frames. Lower it for
+# a quick smoke test, do not raise it past 1300 on this hardware, and
+# do not set to 0 (uncapped) against a real source -- the process
+# will OOM rather than complete.
 flay_dense_max_frames: 1300

@@ -121,18 +121,16 @@ resources:
       region_name: us-east-1
       disable_ssl: true
 
-  # Output of the dense-keyframe-flay path: distinct prefix from flay-result-s3
+  # Output of the dense-keyframe path: distinct prefix from flay-result-s3
   # above so the two modes' outputs never collide/overwrite each other for
-  # the same source name. (Resource name kept `flay-result-exhaustive-s3` for
-  # git-history continuity; only the job that writes to it was renamed in
-  # docs/adr/0001-reframe-exhaustive-as-dense-and-research.md.)
-  - name: flay-result-exhaustive-s3
+  # the same source name.
+  - name: flay-result-dense-s3
     type: s3
     icon: archive-outline
     source:
       endpoint: ((minio_endpoint))
       bucket: ((minio_bucket))
-      regexp: frame-flay/results-exhaustive/flay-result-(.*)\.tar\.gz
+      regexp: frame-flay/results-dense/flay-result-(.*)\.tar\.gz
       access_key_id: ((minio_access_key))
       secret_access_key: ((minio_secret_key))
       region_name: us-east-1
@@ -270,13 +268,12 @@ jobs:
       - put: flay-result-s3
         params: { file: flay-result-tar/*.tar.gz }
 
-  # dense-keyframe-flay: process a dense subset of decoded frames of a
-  # raw video source via a zero-copy GPU-resident pipeline --
-  # PyNvVideoCodec (NVDEC hardware decode) hands frames to CV-CUDA (NV12->
-  # RGB + resize) via DLPack, straight into CLIP as a CUDA tensor. No
-  # frame touches host memory or disk until after HDBSCAN clustering,
-  # when only the winning ~handful of frames per source get re-decoded
-  # and saved as keyframe JPEGs. See concourse/frame-flay/
+  # dense-keyframe-flay: VRAM-bounded dense sampling of a raw video source
+  # via a zero-copy GPU-resident pipeline -- PyNvVideoCodec (NVDEC hardware
+  # decode) hands frames to CV-CUDA (NV12->RGB + resize) via DLPack, straight
+  # into CLIP as a CUDA tensor. No frame touches host memory or disk until
+  # after HDBSCAN clustering, when only the winning ~handful of frames per
+  # source get re-decoded and saved as keyframe JPEGs. See concourse/frame-flay/
   # flay_video_dense.py for the full pipeline.
   #
   # 2026-09-01: added per Gavin -- "I want to sample 100% of frames, and
@@ -286,31 +283,23 @@ jobs:
   # zero-copy via a real decode->convert smoke test) before building this
   # -- see docs/pynvvideocodec-feasibility.md.
   #
-  # 2026-09-02: retitled from "exhaustive-frame-flay" to
-  # "dense-keyframe-flay" per docs/adr/0001-reframe-exhaustive-as-dense-and-research.md.
-  # The job is bounded at flay_dense_max_frames frames per source by
-  # VRAM (NOT by `--max-frames` -- the upstream cvcuda release-bug
-  # documented in the script's module docstring and in
-  # docs/release-bug-investigation.md makes the script's process-lifetime
-  # KEEPALIVE workaround necessary, which caps usable scale to ~1300
-  # frames per process on 24GB VRAM regardless of --max-frames). The
-  # original "100% of frames" goal lives on as a research direction in
-  # branch `exhaustive-frame-orchestrator` (subprocess-per-batch, the
-  # only architecture that breaks the VRAM ceiling without depending
-  # on the upstream fix).
+  # 2026-09-02: reframed from "exhaustive" to "dense" per
+  # docs/adr/0001-reframe-exhaustive-as-dense-and-research.md. The pipeline
+  # is the same; the framing changed because the upstream cvcuda release-bug
+  # (filed as CV-CUDA #298) caps per-process frame count to the VRAM
+  # ceiling (~1300 frames on 24 GB), so calling it "exhaustive" was
+  # misleading. The original "100% of frames" goal is now a research
+  # direction in a sibling branch pursuing a subprocess-per-batch
+  # architecture. flay_dense_max_frames below is set to the production-path
+  # cap; the per-frame VRAM math is in docs/release-bug-investigation.md.
   #
-  # *** KNOWN BLOCKING BUG, NOT YET RESOLVED (see the script's own module
-  # docstring for the full writeup): PyNvVideoCodec/cvcuda's native objects
-  # crash the interpreter the moment ANY of them is released, confirmed
-  # true regardless of cause (cyclic GC, function return, same-scope
-  # reassignment). The script's current workaround is a process-lifetime
-  # KEEPALIVE list that never releases anything -- correct and crash-free
-  # in testing, but VRAM-bounded, not actually "100% of an arbitrarily
-  # large corpus" yet. flay_dense_max_frames below is a REQUIRED
-  # safety valve, not a tuning knob -- an uncapped run against a real
-  # multi-hour source will OOM rather than complete. Treat this job as
-  # "verified-correct at bounded scale, blocked on an upstream library fix
-  # for true exhaustive-corpus scale" until that upstream bug is resolved.
+  # *** UPSTREAM BUG (filed, not blocking this job): PyNvVideoCodec/cvcuda's
+  # native objects crash the interpreter the moment any of them is released,
+  # which is why the script's KEEPALIVE list is process-lifetime and
+  # os._exit(0) skips normal interpreter finalization. Documented in
+  # detail in flay_video_dense.py's module docstring. The upstream fix
+  # would simplify this script's defensive code but is not required for
+  # the dense variant to work.
   #
   # Reads directly from flay-raw-video-s3 (the same raw video resource
   # extract-candidates uses) -- this path doesn't need the CPU-decode
@@ -327,7 +316,7 @@ jobs:
       - get: flay-raw-video-s3
       - put: gpu-lock
         params: { acquire: true }
-      - task: run-dense-keyframe-flay
+      - task: run-dense-flay
         timeout: 12h
         config:
           platform: linux
@@ -388,5 +377,5 @@ jobs:
         ensure:
           put: gpu-lock
           params: { release: gpu-lock }
-      - put: flay-result-exhaustive-s3
+      - put: flay-result-dense-s3
         params: { file: flay-result-tar/*.tar.gz }
