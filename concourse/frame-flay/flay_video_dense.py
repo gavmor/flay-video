@@ -48,6 +48,15 @@ Two passes, deliberately:
      host RAM, but 1M+ raw 1080p frames are not. (The KNOWN BLOCKING BUG
      above currently defeats this VRAM-tractability goal for the pixel
      buffers themselves, even though the embeddings-only design is sound.)
+
+  Note on naming: per docs/adr/0001-reframe-exhaustive-as-dense-and-research.md,
+  this script is the foundation of the "dense" production variant
+  (VRAM-bounded, ~1300 frames on 24GB) and the "100% of frames" research
+  direction (subprocess-per-batch orchestrator, separate branch). The
+  file name still says "exhaustive" for git-history continuity; the
+  job that runs it has been retitled accordingly. Do not interpret
+  the file name as a promise of full-corpus coverage in a single process.
+
   2. HDBSCAN-cluster the full embedding set, then re-seek and re-decode only
      the winning frame per cluster to save as a keyframe JPEG -- cheaper
      than holding every frame's pixels around for the whole run.
@@ -253,7 +262,11 @@ def main():
                      help="cap frames processed per source (0 = no cap). Real safety valve "
                           "given the KNOWN BLOCKING BUG documented at the top of this file -- "
                           "KEEPALIVE grows unboundedly per frame processed, so an uncapped run "
-                          "against a large source will OOM rather than complete.")
+                          "against a large source will OOM rather than complete. Note: on a 24GB "
+                          "card the actual VRAM ceiling (~1300 frames at 1080p) is lower than "
+                          "any --max-frames value you might pick; this knob is a refinement on "
+                          "top of the VRAM ceiling, not a way around it. See "
+                          "docs/exhaustive-scaling-options.md for the math.")
     args = ap.parse_args()
 
     start = time.time()
@@ -319,7 +332,13 @@ def main():
         })
 
     manifest = {
-        "mode": "exhaustive",
+        # See docs/adr/0001-reframe-exhaustive-as-dense-and-research.md.
+        # "dense" = the bounded VRAM ceiling path; "exhaustive" was
+        # honest about the algorithm but misleading about the scale it
+        # can actually run at without depending on the upstream cvcuda
+        # release-bug fix. Keep this in sync if the script's job title
+        # changes again.
+        "mode": "dense",
         "sources": [v.name for v in videos],
         "params": vars(args) | {"input_dir": str(args.input_dir), "output_dir": str(args.output_dir)},
         "frames_sampled": total_sampled,

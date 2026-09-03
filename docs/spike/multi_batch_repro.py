@@ -51,7 +51,7 @@ def build_script():
         textwrap.dedent(
             """
             import os, sys, gc
-            # Same env as flay_video_exhaustive.py -- disable HF progress
+            # Same env as flay_video_dense.py -- disable HF progress
             # bar thread and torch progress monitoring that could race with
             # the native decoder cleanup.
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -66,7 +66,7 @@ def build_script():
                 decoder = DecoderClass(VIDEO_PATH_PLACEHOLDER, use_device_memory=True)
 
             # Module-scope list, never reassigned before the test point.
-            # This mirrors flay_video_exhaustive.py's KEEPALIVE pattern exactly.
+            # This mirrors flay_video_dense.py's KEEPALIVE pattern exactly.
             keepalive = []
             try:
                 for batch_idx in range(N_BATCHES):

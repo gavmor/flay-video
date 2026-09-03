@@ -5,7 +5,7 @@
 
 ## Summary
 
-**Feasible, with one real open bug.** The zero-copy NVDEC → CV-CUDA → CLIP pipeline works correctly — decode, color conversion, and CLIP embedding all verified against real video. But a native-library bug in the current `PyNvVideoCodec`/`cvcuda-cu12` versions crashes the Python interpreter the moment any of their objects are released, which currently caps real usable scale well short of "100% of frames of a multi-hour source." See `concourse/frame-flay/flay_video_exhaustive.py`'s module docstring for the full technical writeup; this doc is the narrative version.
+**Feasible, with one real open bug.** The zero-copy NVDEC → CV-CUDA → CLIP pipeline works correctly — decode, color conversion, and CLIP embedding all verified against real video. But a native-library bug in the current `PyNvVideoCodec`/`cvcuda-cu12` versions crashes the Python interpreter the moment any of their objects are released, which currently caps real usable scale well short of "100% of frames of a multi-hour source." See `concourse/frame-flay/flay_video_dense.py`'s module docstring for the full technical writeup; this doc is the narrative version.
 
 ## What's confirmed working
 
@@ -30,9 +30,9 @@ Isolated and ruled out one at a time:
 - **Not tied to any specific extra computation** (quality-filter ops, `torch.no_grad()`, calling `get_stream_metadata()` first) — each tested in isolation, none triggered or prevented it on their own.
 - **The actual trigger:** any release at all, including a plain `keepalive = []` reassignment between batches in the exact same scope with no function boundary crossed.
 
-**Current workaround:** a process-lifetime `KEEPALIVE` list in `flay_video_exhaustive.py` that never releases anything — objects only actually get freed when the whole process exits via `os._exit(0)` (a normal `sys.exit()`/return also crashes at interpreter finalization for the same underlying reason, independent of whether `dec.stop()` is called — which is itself separately broken in this package version, raising `AttributeError` unconditionally).
+**Current workaround:** a process-lifetime `KEEPALIVE` list in `flay_video_dense.py` that never releases anything — objects only actually get freed when the whole process exits via `os._exit(0)` (a normal `sys.exit()`/return also crashes at interpreter finalization for the same underlying reason, independent of whether `dec.stop()` is called — which is itself separately broken in this package version, raising `AttributeError` unconditionally).
 
-**What this means practically:** the script is correct and crash-free at bounded scale (verified: 24 real frames, 3 batches, full pipeline including clustering and keyframe writing). It is **not yet** the true "process 100% of frames of an arbitrarily large corpus" capability — holding every processed frame's GPU buffers alive simultaneously for a 13-hour/~1.12M-frame source would need roughly 10TB of VRAM. `--max-frames` (wired into the Concourse job as `flay_exhaustive_max_frames`) is a required safety valve, not a tuning knob, until this is actually resolved upstream.
+**What this means practically:** the script is correct and crash-free at bounded scale (verified: 24 real frames, 3 batches, full pipeline including clustering and keyframe writing). It is **not yet** the true "process 100% of frames of an arbitrarily large corpus" capability — holding every processed frame's GPU buffers alive simultaneously for a 13-hour/~1.12M-frame source would need roughly 10TB of VRAM. `--max-frames` (wired into the Concourse job as `flay_dense_max_frames`) is a required safety valve, not a tuning knob, until this is actually resolved upstream.
 
 ## Source of the throughput numbers
 
@@ -40,7 +40,10 @@ The original smoke-test script behind the ~400fps figure above was never preserv
 
 ## Not yet attempted
 
-- Reporting the bug upstream to the PyNvVideoCodec or CV-CUDA projects.
-- `PyNvVideoCodec.ThreadedDecoder` instead of `SimpleDecoder` (a different class in the same package — untested here, might have different buffer-lifetime semantics).
-- Different package versions, if/when ones without this bug become available.
-- A batched (not single-frame-at-a-time) throughput benchmark at real scale — the ~400fps number above predates this session's bug-hunting and used a simpler, non-batched test loop.
+- A batched (not single-frame-at-a-time) throughput benchmark at real scale — the ~400fps number above predates this session's bug-hunting and used a simpler, non-batched test loop. The `dense-keyframe-flay` job's real `flay_video_dense.py` does run batched (`--batch-size`, default 16) and is what would be benchmarked; no production-scale run against a real multi-hour source has happened yet.
+
+## Resolved (see `release-bug-investigation.md` for the full writeup)
+
+- ~~Reporting the bug upstream to the PyNvVideoCodec or CV-CUDA projects.~~ Filed as [CV-CUDA issue #298](https://github.com/CVCUDA/CV-CUDA/issues/298), with explicit references to prior instances #72 and #188.
+- ~~`PyNvVideoCodec.ThreadedDecoder` instead of `SimpleDecoder`~~ — tested, same bug, same crash signature. `ThreadedDecoder` is a multi-threaded *fetch* primitive, not a different buffer-lifetime model.
+- ~~Different package versions, if/when ones without this bug become available.~~ Bug reproduces in every version combination on PyPI: PyNvVideoCodec 2.0.0/2.0.5/2.1/2.2.2 × cvcuda 0.15/0.16/0.17. No version-upgrade path exists. The fix has to come from a code change in CV-CUDA or PyNvVideoCodec.

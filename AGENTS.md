@@ -144,11 +144,11 @@ flay-result/
 
 A second pipeline mode exists on the `origin/exhaustive-frame` branch. Status as of 2026-09-01: pushed for review, not yet `fly set-pipeline`d, not yet triggered against a real corpus. Treat it as **work-in-progress with a known blocking upstream bug**, not as production-ready. Don't merge to main or trigger it without explicit owner go-ahead.
 
-What it adds (see `concourse/frame-flay/flay_video_exhaustive.py` on the branch):
+What it adds (see `concourse/frame-flay/flay_video_dense.py` on the branch — renamed from `flay_video_exhaustive.py` per `docs/adr/0001-reframe-exhaustive-as-dense-and-research.md`):
 
 - NVDEC hardware decode via PyNvVideoCodec → CV-CUDA color convert → CLIP embed, all VRAM-resident via DLPack. No frame touches host memory or disk until the final ~handful of cluster winners get re-decoded and saved as JPEGs.
 - Two-pass design: pass 1 decodes + embeds every frame and discards pixels immediately (only embedding vectors + `(source_file, frame_index)` survive — this is what would make a 1M+-frame corpus tractable in VRAM); pass 2 HDBSCAN-clusters the embeddings, then re-decodes only the cluster winners.
-- A new `exhaustive-frame-flay` job in `pipeline.yml` (on the branch), behind the same `gpu-lock` pool + `serial_groups: [gpu]`, with `ensure: release`. Separate S3 output prefix (`frame-flay/results-exhaustive/`) so its runs never collide with the sparse-sampling `flay-video` job's results.
+- A new `dense-keyframe-flay` job in `pipeline.yml` (on the branch — renamed from `exhaustive-frame-flay`), behind the same `gpu-lock` pool + `serial_groups: [gpu]`, with `ensure: release`. Separate S3 output prefix (`frame-flay/results-exhaustive/`) so its runs never collide with the sparse-sampling `flay-video` job's results. The original "100% of frames" goal lives on as a research direction in branch `exhaustive-frame-orchestrator` (subprocess-per-batch, the only architecture that breaks the VRAM ceiling without depending on the upstream cvcuda release-bug fix).
 - `docs/spike/nvdec_cvcuda_smoke_test.py` is the throughput smoke test for this path (~400fps measured, real). Preserved on the branch because the original got lost when local scratch was wiped — a subagent rebuilt it from a build log and re-ran it live to confirm the numbers are real.
 
 ### Open blocking bug (do not paper over)
@@ -161,13 +161,12 @@ PyNvVideoCodec 2.2.2 / `cvcuda-cu12` 0.17.0 native objects (`DecodedFrame`, `cvc
 
 The only mitigation that has held up in testing is never releasing any of these objects until the process calls `os._exit(0)`. Consequence: the current implementation is verified-correct at bounded scale (tested: 24 real frames, full pipeline, no crash) but **not yet** the true "sample 100% of an arbitrarily large corpus" capability — a 13-hour / ~1.12M-frame source at full resolution would need roughly 10 TB of VRAM held simultaneously under this workaround.
 
-This is why `--max-frames` (driven by the new `flay_exhaustive_max_frames` pipeline var) is wired in as a **required safety valve** — the script will OOM rather than silently run away. There is no flag to disable it; the design assumption is that anyone triggering an exhaustive run knows the bound.
+This is why `--max-frames` (driven by the `flay_dense_max_frames` pipeline var, default 1300) is wired in as a **required safety valve** — the script will OOM rather than silently run away. There is no flag to disable it; the design assumption is that anyone triggering a dense-keyframe run knows the bound (the VRAM ceiling, not a user-set tuning knob).
 
 ### What's not yet tried (logged in `docs/pynvvideocodec-feasibility.md`)
 
-- Reporting the bug upstream to the PyNvVideoCodec / cvcuda projects
-- `ThreadedDecoder` instead of `SimpleDecoder`
-- Other package versions once available without the bug
+- The third "not yet attempted" item from the original feasibility doc — a batched throughput benchmark at real scale — is genuinely still untested. The single-frame-at-a-time ~400fps number in the feasibility doc predates this session's bug-hunting and was a simpler non-batched test loop.
+- The two local-track workarounds (ThreadedDecoder, version pinning) have been investigated and ruled out — see `docs/release-bug-investigation.md`. The upstream report has been filed as [CV-CUDA issue #298](https://github.com/CVCUDA/CV-CUDA/issues/298) and is awaiting maintainer response.
 
 ### What the branch is NOT
 
