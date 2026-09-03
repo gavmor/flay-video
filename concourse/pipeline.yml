@@ -121,9 +121,11 @@ resources:
       region_name: us-east-1
       disable_ssl: true
 
-  # Output of the exhaustive-frame path: distinct prefix from flay-result-s3
+  # Output of the dense-keyframe-flay path: distinct prefix from flay-result-s3
   # above so the two modes' outputs never collide/overwrite each other for
-  # the same source name.
+  # the same source name. (Resource name kept `flay-result-exhaustive-s3` for
+  # git-history continuity; only the job that writes to it was renamed in
+  # docs/adr/0001-reframe-exhaustive-as-dense-and-research.md.)
   - name: flay-result-exhaustive-s3
     type: s3
     icon: archive-outline
@@ -268,14 +270,14 @@ jobs:
       - put: flay-result-s3
         params: { file: flay-result-tar/*.tar.gz }
 
-  # exhaustive-frame-flay: process every decoded frame of a raw video
-  # source (not a sparse sample) via a zero-copy GPU-resident pipeline --
+  # dense-keyframe-flay: process a dense subset of decoded frames of a
+  # raw video source via a zero-copy GPU-resident pipeline --
   # PyNvVideoCodec (NVDEC hardware decode) hands frames to CV-CUDA (NV12->
   # RGB + resize) via DLPack, straight into CLIP as a CUDA tensor. No
   # frame touches host memory or disk until after HDBSCAN clustering,
   # when only the winning ~handful of frames per source get re-decoded
   # and saved as keyframe JPEGs. See concourse/frame-flay/
-  # flay_video_exhaustive.py for the full pipeline.
+  # flay_video_dense.py for the full pipeline.
   #
   # 2026-09-01: added per Gavin -- "I want to sample 100% of frames, and
   # I want to sample large corpuses of large videos." Verified feasible
@@ -284,6 +286,19 @@ jobs:
   # zero-copy via a real decode->convert smoke test) before building this
   # -- see docs/pynvvideocodec-feasibility.md.
   #
+  # 2026-09-02: retitled from "exhaustive-frame-flay" to
+  # "dense-keyframe-flay" per docs/adr/0001-reframe-exhaustive-as-dense-and-research.md.
+  # The job is bounded at flay_dense_max_frames frames per source by
+  # VRAM (NOT by `--max-frames` -- the upstream cvcuda release-bug
+  # documented in the script's module docstring and in
+  # docs/release-bug-investigation.md makes the script's process-lifetime
+  # KEEPALIVE workaround necessary, which caps usable scale to ~1300
+  # frames per process on 24GB VRAM regardless of --max-frames). The
+  # original "100% of frames" goal lives on as a research direction in
+  # branch `exhaustive-frame-orchestrator` (subprocess-per-batch, the
+  # only architecture that breaks the VRAM ceiling without depending
+  # on the upstream fix).
+  #
   # *** KNOWN BLOCKING BUG, NOT YET RESOLVED (see the script's own module
   # docstring for the full writeup): PyNvVideoCodec/cvcuda's native objects
   # crash the interpreter the moment ANY of them is released, confirmed
@@ -291,7 +306,7 @@ jobs:
   # reassignment). The script's current workaround is a process-lifetime
   # KEEPALIVE list that never releases anything -- correct and crash-free
   # in testing, but VRAM-bounded, not actually "100% of an arbitrarily
-  # large corpus" yet. flay_exhaustive_max_frames below is a REQUIRED
+  # large corpus" yet. flay_dense_max_frames below is a REQUIRED
   # safety valve, not a tuning knob -- an uncapped run against a real
   # multi-hour source will OOM rather than complete. Treat this job as
   # "verified-correct at bounded scale, blocked on an upstream library fix
@@ -305,14 +320,14 @@ jobs:
   # quick sub-2-minute task like flay-video's CLIP-on-a-subset run) --
   # exclusivity against every other GPU-touching pipeline on this box
   # matters even more here.
-  - name: exhaustive-frame-flay
+  - name: dense-keyframe-flay
     serial_groups: [gpu]
     plan:
       - get: workflow-repo
       - get: flay-raw-video-s3
       - put: gpu-lock
         params: { acquire: true }
-      - task: run-exhaustive-flay
+      - task: run-dense-keyframe-flay
         timeout: 12h
         config:
           platform: linux
@@ -336,8 +351,8 @@ jobs:
             # set alone leaves those libraries unmounted and ffmpeg/PyNvVideoCodec
             # segfault trying to load them.
             NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
-            FLAY_BATCH_SIZE: ((flay_exhaustive_batch_size))
-            FLAY_MAX_FRAMES: ((flay_exhaustive_max_frames))
+            FLAY_BATCH_SIZE: ((flay_dense_batch_size))
+            FLAY_MAX_FRAMES: ((flay_dense_max_frames))
             FLAY_MIN_CLUSTER_SIZE: ((flay_min_cluster_size))
             FLAY_MIN_SAMPLES: ((flay_min_samples))
             FLAY_BLUR_THRESHOLD: ((flay_blur_threshold))
@@ -358,7 +373,7 @@ jobs:
                 if [ -n "$FLAY_MIN_SAMPLES" ] && [ "$FLAY_MIN_SAMPLES" != "null" ]; then
                   MIN_SAMPLES_ARG="--min-samples $FLAY_MIN_SAMPLES"
                 fi
-                python3 workflow-repo/concourse/frame-flay/flay_video_exhaustive.py \
+                python3 workflow-repo/concourse/frame-flay/flay_video_dense.py \
                   --input-dir raw-video \
                   --output-dir flay-result \
                   --batch-size "$FLAY_BATCH_SIZE" \

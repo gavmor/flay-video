@@ -26,7 +26,7 @@ with less VRAM by editing N_FRAMES down, or by running on a less
 contested GPU.
 
 Not the CLIP-feeding pipeline -- the original smoke test stopped at
-resize. See ../../concourse/frame-flay/flay_video_exhaustive.py for the
+resize. See ../../concourse/frame-flay/flay_video_dense.py for the
 full decode->convert->embed chain (which also documents a separate,
 later-discovered blocking bug in this same object-lifetime area).
 
